@@ -4,7 +4,8 @@ import pickle
 import time
 from concurrent.futures import ThreadPoolExecutor
 import threading
-from Preprocessing.goldstein_uchida_preprocess import preprocess_goldstein_uchida
+# from Preprocessing.goldstein_uchida_preprocess import preprocess_goldstein_uchida
+from Preprocessing.mitbih_preprocess import preprocess_mitbih
 from Preprocessing.ccpp_preprocess import preprocess_ccpp
 from data_bucketing import perform_bucketing
 from feature_selection import select_features
@@ -145,7 +146,7 @@ def process_iteration(iteration, num_qubits, decoder_option, preprocessed_data, 
     print(f"Bucket size: {bucket_size}")
 
     # Run feature selection on the data to select features for amplitude encoding
-    selected_data, selected_features = select_features(preprocessed_data, num_qubits, strategy='e')
+    selected_data, selected_features = select_features(preprocessed_data, num_qubits, strategy='f')
     
     print(f"Number of features selected: {len(selected_features)}")
     print("Selected features:", selected_features)
@@ -222,17 +223,17 @@ def main():
     num_qubits = args.num_qubits
     decoder_option = args.decoder_option
     num_threads = args.num_threads
-    num_iterations = 1000
+    num_iterations = 50
     num_bucketruns = 1
     target_proportion = 0.50
     anomaly_likelihood_per_bucket = 0.98
 
     start_time = time.time()
 
-    file_path = './Data/Goldstein_Uchida_datasets/breast-cancer-unsupervised-ad.csv'
+    # file_path = './Data/Goldstein_Uchida_datasets/breast-cancer-unsupervised-ad.csv'
 
     #Preprocess the data
-    preprocessed_data, high_risk_indices, _ = preprocess_goldstein_uchida(file_path)
+    preprocessed_data, high_risk_indices, _ = preprocess_mitbih("Data/MIT_BIH", "100")
     
     print(f"Initial dataset size: {len(preprocessed_data)}")
     print(f"Total number of anomalies: {len(high_risk_indices)}")

@@ -52,6 +52,22 @@ def create_data_buckets(num_datapoints: int, num_anomalies: int, target_probabil
     
     return buckets
 
+def create_temporal_buckets(num_datapoints, num_anomalies,
+                            target_probability=0.5,
+                            rr_groups=None):
+    p_anomaly = num_anomalies / num_datapoints
+    bucket_size = estimate_bucket_size(p_anomaly, target_probability)
+    if rr_groups is not None:
+        # sort indices within each RR regime, then slice
+        ordered = []
+        for group in rr_groups:
+            ordered.extend(sorted(group))
+    else:
+        ordered = list(range(num_datapoints))  # time order, no shuffle
+    buckets = [ordered[i:i+bucket_size]
+               for i in range(0, num_datapoints, bucket_size)]
+    return buckets
+
 def perform_bucketing(preprocessed_data: np.ndarray, high_risk_indices: List[int], target_probability: float = 0.5) -> Tuple[List[List[int]], int]:
     """
     Perform the bucketing process on the preprocessed data.

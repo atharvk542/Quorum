@@ -76,8 +76,16 @@ def select_features(data, num_qubits, strategy='a'):
             replace=False,
             p=feature_importance / feature_importance.sum()
         )
+    elif strategy == 'f':
+    # Temporal: pick one contiguous block of length num_features
+    # starting at a random valid offset
+        max_start = original_num_features - num_features
+        start = np.random.randint(0, max(1, max_start + 1))
+        selected_indices = list(range(start, start + num_features))
+        selected_features = data.columns[selected_indices]
+        return data[selected_features], selected_indices
     else:
-        raise ValueError("Invalid strategy. Choose 'a', 'b', 'c', 'd', or 'e'.")
+        raise ValueError("Invalid strategy. Choose 'a', 'b', 'c', 'd', 'e', or 'f'.")
     
     selected_features = data.columns[selected_indices]
     return data[selected_features], selected_indices.tolist()

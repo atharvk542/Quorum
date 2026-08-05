@@ -31,6 +31,16 @@ from scipy.signal import find_peaks
 NORMAL_LABEL = "N"
 SKIP_LABELS  = {"+", "~", "[", "]", "!", "|"}   # rhythm/noise markers, not beats
 
+# Number of beats on each side used to compute the local RR z-score's
+# mean/std window (window length = 2 * RR_LOCAL_WINDOW_BEATS + 1).
+RR_LOCAL_WINDOW_BEATS = 10
+
+# Column names of the protected RR-derived features appended by
+# extract_beat_windows when include_rr=True. These are meant to be reserved
+# (always included, never subject to random selection) via select_features's
+# protected_features argument -- see feature_selection.py.
+RR_FEATURE_COLUMNS = ["rr_prev", "rr_next", "rr_local_zscore"]
+
 
 def parse_annotations(ann_path: str) -> pd.DataFrame:
     """
@@ -112,14 +122,19 @@ def extract_beat_windows(
     lead        : Which ECG lead to use as the primary signal.
     include_diff: If True, append the first-difference (slope) of the window
                   as extra features.  Doubles feature count.
-    include_rr  : If True, append the preceding RR interval (in samples) as a
-                  single extra scalar feature.
+    include_rr  : If True, append three protected RR-derived columns (see
+                  RR_FEATURE_COLUMNS): the preceding RR interval (rr_prev),
+                  the following RR interval (rr_next), both in samples, and
+                  a local RR z-score (rr_prev normalized against the mean/std
+                  of RR intervals in a window of RR_LOCAL_WINDOW_BEATS beats
+                  on each side within this record), which reflects local
+                  rhythm irregularity rather than only an absolute interval.
 
     Returns
     -------
-    features_df     : DataFrame where each row is one beat window.
-                      Column names are f0, f1, ..., fN (or descriptive names
-                      when include_diff / include_rr are used).
+    features_df     : DataFrame where each row is one beat window. Morphology
+                      column names are f0, f1, ..., fN; RR columns (when
+                      include_rr=True) are named per RR_FEATURE_COLUMNS.
                       The DataFrame index is the sequential beat index (0-based).
     anomaly_indices : List of integer indices (into features_df) of anomalous beats.
     """
@@ -128,6 +143,7 @@ def extract_beat_windows(
 
     beat_samples  = ann_df["sample"].values
     beat_labels   = ann_df["label"].values
+    n_beats       = len(beat_samples)
 
     rows          = []
     beat_idx_list = []   # original beat indices that survived boundary checks
@@ -146,14 +162,6 @@ def extract_beat_windows(
         else:
             features = window.copy()
 
-        if include_rr:
-            # RR interval: distance from previous beat (use 0 for the first beat)
-            if i == 0:
-                rr = 0.0
-            else:
-                rr = float(s - beat_samples[i - 1])
-            features = np.append(features, rr)
-
         rows.append(features)
         beat_idx_list.append(i)
 
@@ -161,6 +169,42 @@ def extract_beat_windows(
     n_features = len(rows[0]) if rows else 0
     col_names = [f"f{j}" for j in range(n_features)]
     features_df = pd.DataFrame(rows, columns=col_names)
+
+    if include_rr and n_beats > 0:
+        # rr_prev/rr_next computed over *all* annotated beats in the record
+        # (RR only depends on annotation sample positions, not the signal
+        # window), then subset down to the beats that survived the boundary
+        # check above. First/last beat in the record has no rr_prev/rr_next
+        # respectively -- imputed with the record's median RR interval
+        # rather than dropped, matching how the existing pipeline already
+        # keeps boundary beats wherever possible.
+        rr_prev = np.full(n_beats, np.nan)
+        rr_next = np.full(n_beats, np.nan)
+        if n_beats > 1:
+            diffs = np.diff(beat_samples).astype(float)
+            rr_prev[1:] = diffs
+            rr_next[:-1] = diffs
+            median_rr = float(np.median(diffs))
+        else:
+            median_rr = 0.0
+        rr_prev = np.where(np.isnan(rr_prev), median_rr, rr_prev)
+        rr_next = np.where(np.isnan(rr_next), median_rr, rr_next)
+
+        # Local RR z-score: rr_prev normalized against the mean/std of RR
+        # intervals in a local window of surrounding beats, so the feature
+        # captures local rhythm irregularity rather than only an absolute
+        # interval. Falls back to 0 where the local std is 0 or undefined
+        # (e.g. near the very start/end of a record).
+        rr_prev_series = pd.Series(rr_prev)
+        window_size = 2 * RR_LOCAL_WINDOW_BEATS + 1
+        local_mean = rr_prev_series.rolling(window=window_size, center=True, min_periods=3).mean()
+        local_std  = rr_prev_series.rolling(window=window_size, center=True, min_periods=3).std()
+        local_std  = local_std.replace(0, np.nan)
+        rr_local_zscore = ((rr_prev_series - local_mean) / local_std).fillna(0.0).values
+
+        features_df["rr_prev"]         = rr_prev[beat_idx_list]
+        features_df["rr_next"]         = rr_next[beat_idx_list]
+        features_df["rr_local_zscore"] = rr_local_zscore[beat_idx_list]
 
     # Map original beat indices → row indices in features_df
     orig_to_row = {orig: row for row, orig in enumerate(beat_idx_list)}
@@ -197,6 +241,62 @@ def normalize_for_quorum(features_df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _extract_record_features(
+    data_dir: str,
+    record_id: str,
+    window_half: int,
+    lead: str,
+    include_diff: bool,
+    include_rr: bool,
+) -> tuple[pd.DataFrame, list[int], dict]:
+    """
+    Load one record and return its RAW (un-normalized) beat-window feature
+    matrix, anomaly indices, and metadata. Shared by preprocess_mitbih and
+    preprocess_mitbih_multi so normalization can be applied once, at the
+    right point, by each caller.
+    """
+    csv_path = os.path.join(data_dir, f"{record_id}.csv")
+    ann_path = os.path.join(data_dir, f"{record_id}annotations.txt")
+
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"CSV not found: {csv_path}")
+    if not os.path.exists(ann_path):
+        raise FileNotFoundError(f"Annotations not found: {ann_path}")
+
+    signal_df = load_signal(csv_path)
+    ann_df    = parse_annotations(ann_path)
+
+    features_df, anomaly_indices = extract_beat_windows(
+        signal_df,
+        ann_df,
+        window_half=window_half,
+        lead=lead,
+        include_diff=include_diff,
+        include_rr=include_rr,
+    )
+
+    label_counts = (
+        ann_df[ann_df["label"] != NORMAL_LABEL]["label"]
+        .value_counts()
+        .to_dict()
+    )
+
+    metadata = {
+        "record_id":           record_id,
+        "n_beats":             len(features_df),
+        "n_anomalies":         len(anomaly_indices),
+        "n_features":          features_df.shape[1],
+        "window_half":         window_half,
+        "lead":                lead,
+        "include_diff":        include_diff,
+        "include_rr":          include_rr,
+        "rr_feature_columns":  list(RR_FEATURE_COLUMNS) if include_rr else [],
+        "anomaly_label_counts": label_counts,
+    }
+
+    return features_df, anomaly_indices, metadata
+
+
 def preprocess_mitbih(
     data_dir: str,
     record_id: str | int,
@@ -229,46 +329,12 @@ def preprocess_mitbih(
                                         anomaly_label_counts.
     """
     record_id = str(record_id)
-    csv_path  = os.path.join(data_dir, f"{record_id}.csv")
-    ann_path  = os.path.join(data_dir, f"{record_id}annotations.txt")
-
-    if not os.path.exists(csv_path):
-        raise FileNotFoundError(f"CSV not found: {csv_path}")
-    if not os.path.exists(ann_path):
-        raise FileNotFoundError(f"Annotations not found: {ann_path}")
-
-    signal_df = load_signal(csv_path)
-    ann_df    = parse_annotations(ann_path)
-
-    features_df, anomaly_indices = extract_beat_windows(
-        signal_df,
-        ann_df,
-        window_half=window_half,
-        lead=lead,
-        include_diff=include_diff,
-        include_rr=include_rr,
+    features_df, anomaly_indices, metadata = _extract_record_features(
+        data_dir, record_id, window_half, lead, include_diff, include_rr
     )
 
     preprocessed_data = normalize_for_quorum(features_df)
-
-    # Count anomaly types for metadata
-    label_counts = (
-        ann_df[ann_df["label"] != NORMAL_LABEL]["label"]
-        .value_counts()
-        .to_dict()
-    )
-
-    metadata = {
-        "record_id":           record_id,
-        "n_beats":             len(preprocessed_data),
-        "n_anomalies":         len(anomaly_indices),
-        "n_features":          preprocessed_data.shape[1],
-        "window_half":         window_half,
-        "lead":                lead,
-        "include_diff":        include_diff,
-        "include_rr":          include_rr,
-        "anomaly_label_counts": label_counts,
-    }
+    metadata["n_beats"] = len(preprocessed_data)
 
     return preprocessed_data, anomaly_indices, metadata
 
@@ -290,6 +356,14 @@ def preprocess_mitbih_multi(
     Load multiple MIT-BIH records and concatenate them into one feature matrix.
     The anomaly_indices returned are global row indices into the combined DataFrame.
 
+    Normalization is applied once, on the concatenated raw feature matrix,
+    not per-record. Each record's own min/max ranges differ (e.g. baseline
+    ECG amplitude/variance), so normalizing per-record before concatenating
+    would rescale each record onto its own [0, 1] range independently --
+    injecting a record-identity signal that swamps genuine cross-patient
+    anomaly signal once buckets mix records together (as the non-temporal,
+    randomly-shuffled bucketing does).
+
     Useful for training / evaluating Quorum across many patients in one run.
     """
     all_features    = []
@@ -298,8 +372,9 @@ def preprocess_mitbih_multi(
     row_offset      = 0
 
     for rid in record_ids:
+        rid = str(rid)
         try:
-            df, anoms, meta = preprocess_mitbih(
+            df, anoms, meta = _extract_record_features(
                 data_dir, rid, window_half, lead, include_diff, include_rr
             )
         except FileNotFoundError as e:
@@ -314,15 +389,16 @@ def preprocess_mitbih_multi(
     if not all_features:
         raise RuntimeError("No records were successfully loaded.")
 
-    combined_df = pd.concat(all_features, ignore_index=True)
+    combined_df = normalize_for_quorum(pd.concat(all_features, ignore_index=True))
     combined_meta = {
-        "records":       [m["record_id"] for m in all_meta],
-        "n_beats":       sum(m["n_beats"] for m in all_meta),
-        "n_anomalies":   len(all_anomalies),
-        "n_features":    combined_df.shape[1],
-        "window_half":   window_half,
-        "lead":          lead,
-        "per_record":    all_meta,
+        "records":            [m["record_id"] for m in all_meta],
+        "n_beats":            sum(m["n_beats"] for m in all_meta),
+        "n_anomalies":        len(all_anomalies),
+        "n_features":         combined_df.shape[1],
+        "window_half":        window_half,
+        "lead":               lead,
+        "rr_feature_columns": all_meta[0]["rr_feature_columns"] if all_meta else [],
+        "per_record":         all_meta,
     }
 
     return combined_df, all_anomalies, combined_meta

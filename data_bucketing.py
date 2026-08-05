@@ -54,7 +54,23 @@ def create_data_buckets(num_datapoints: int, num_anomalies: int, target_probabil
 
 def create_temporal_buckets(num_datapoints, num_anomalies,
                             target_probability=0.5,
-                            rr_groups=None):
+                            rr_groups=None,
+                            overlap=0.0,
+                            jitter=False):
+    """
+    Args:
+    overlap (float): Fraction of bucket_size that consecutive buckets share,
+        in [0, 1). 0 reproduces the original disjoint partition (each point
+        in exactly one bucket); e.g. 0.5 means each point falls into ~2
+        overlapping buckets, so it gets compared against multiple different
+        local neighborhoods within the same iteration.
+    jitter (bool): If True, shift the partition/window start by a random
+        offset in [0, stride) each call, so which points share a bucket
+        varies across ensemble iterations instead of being the exact same
+        fixed partition every time (the original behavior gave every point
+        identical bucket-mates on every single iteration -- zero ensemble
+        diversity on the bucketing axis).
+    """
     p_anomaly = num_anomalies / num_datapoints
     bucket_size = estimate_bucket_size(p_anomaly, target_probability)
     if rr_groups is not None:
@@ -64,29 +80,45 @@ def create_temporal_buckets(num_datapoints, num_anomalies,
             ordered.extend(sorted(group))
     else:
         ordered = list(range(num_datapoints))  # time order, no shuffle
-    buckets = [ordered[i:i+bucket_size]
-               for i in range(0, num_datapoints, bucket_size)]
+
+    stride = max(1, int(round(bucket_size * (1 - overlap))))
+    offset = int(np.random.randint(0, stride)) if jitter else 0
+
+    buckets = []
+    for start in range(-offset, num_datapoints, stride):
+        window = ordered[max(start, 0):start + bucket_size]
+        if window:
+            buckets.append(window)
     return buckets
 
-def perform_bucketing(preprocessed_data: np.ndarray, high_risk_indices: List[int], target_probability: float = 0.5) -> Tuple[List[List[int]], int]:
+def perform_bucketing(preprocessed_data: np.ndarray, high_risk_indices: List[int], target_probability: float = 0.5, temporal: bool = False, overlap: float = 0.0, jitter: bool = False) -> Tuple[List[List[int]], int]:
     """
     Perform the bucketing process on the preprocessed data.
-    
+
     Args:
     preprocessed_data (np.ndarray): The preprocessed dataset
     high_risk_indices (List[int]): List of indices of high-risk (anomalous) datapoints
     target_probability (float): Desired probability of having at least one anomaly in a bucket
-    
+    temporal (bool): If True, group points in time order via create_temporal_buckets
+        (so temporally-clustered anomalies land in the same bucket) instead of the
+        random shuffle used by create_data_buckets.
+    overlap (float): Passed through to create_temporal_buckets when temporal=True.
+    jitter (bool): Passed through to create_temporal_buckets when temporal=True.
+
     Returns:
     Tuple[List[List[int]], int]: A tuple containing the list of buckets and the bucket size
     """
     num_datapoints = len(preprocessed_data)
     num_anomalies = len(high_risk_indices)
-    
-    buckets = create_data_buckets(num_datapoints, num_anomalies, target_probability)
+
+    if temporal:
+        buckets = create_temporal_buckets(num_datapoints, num_anomalies, target_probability,
+                                           overlap=overlap, jitter=jitter)
+    else:
+        buckets = create_data_buckets(num_datapoints, num_anomalies, target_probability)
     bucket_size = len(buckets[0])  # all buckets except possibly the last one will have this size
-    
+
     print(f"Created {len(buckets)} buckets with a target size of {bucket_size} datapoints each.")
     print(f"Probability of at least one anomaly in each bucket: {target_probability}")
-    
+
     return buckets, bucket_size
